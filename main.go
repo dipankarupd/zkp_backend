@@ -31,10 +31,11 @@ func main() {
 	router := mux.NewRouter()
 
 	// Register routes
-	routes.RegisterNewRoutes(router)
+	routes.RegisterNewRoutes(router, *database)
 
 	// Get the port from environment variable or use default
 	port := os.Getenv("PORT")
+	fmt.Printf("Port: %s", port)
 	if port == "" {
 		port = "8080"
 	}
