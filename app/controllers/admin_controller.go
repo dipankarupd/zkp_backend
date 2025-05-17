@@ -1,7 +1,9 @@
 package controllers
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -508,4 +510,87 @@ func GetAllClasses(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func MakeCSV(w http.ResponseWriter, r *http.Request) {}
+func MakeCSV(w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+	classroomIDStr := params["id"]
+
+	classroomID, err := strconv.Atoi(classroomIDStr)
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusBadRequest, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Invalid classroom ID",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Query student summary: id, name, present_count, absent_count
+	rows, err := DB.Query(`
+		SELECT s.id, s.name, COALESCE(r.present_count, 0), COALESCE(r.absent_count, 0)
+		FROM students s
+		INNER JOIN student_classroom_enrollment e ON s.id = e.student_id
+		LEFT JOIN record r ON s.id = r.student_id AND r.classroom_id = $1
+		WHERE e.classroom_id = $1
+	`, classroomID)
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Failed to fetch student data",
+			Data:    nil,
+		})
+		return
+	}
+	defer rows.Close()
+
+	var csvData [][]string
+	// Header row
+	csvData = append(csvData, []string{"Student ID", "Name", "Total Classes", "Present Count", "Absent Count", "Attendance Percentage"})
+
+	for rows.Next() {
+		var id, name string
+		var present, absent int
+		if err := rows.Scan(&id, &name, &present, &absent); err != nil {
+			utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+				Status:  "error",
+				Message: "Failed to scan row",
+				Data:    nil,
+			})
+			return
+		}
+
+		total := present + absent
+		percentage := 0.0
+		if total > 0 {
+			percentage = float64(present) / float64(total) * 100
+		}
+
+		csvData = append(csvData, []string{
+			id,
+			name,
+			strconv.Itoa(total),
+			strconv.Itoa(present),
+			strconv.Itoa(absent),
+			fmt.Sprintf("%.2f", percentage),
+		})
+	}
+
+	// Create buffer to write CSV in-memory
+	var buf bytes.Buffer
+	writer := csv.NewWriter(&buf)
+	err = writer.WriteAll(csvData)
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Failed to write CSV data",
+			Data:    nil,
+		})
+		return
+	}
+	writer.Flush()
+
+	// Set headers for file download
+	w.Header().Set("Content-Disposition", "attachment; filename=attendance_report.csv")
+	w.Header().Set("Content-Type", "text/csv")
+	w.WriteHeader(http.StatusOK)
+	w.Write(buf.Bytes())
+}

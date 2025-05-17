@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -194,6 +195,31 @@ func JoinClassroom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if the first class has already started
+	var firstClassStart time.Time
+	firstClassQuery := `
+		SELECT MIN(start_time) FROM classes 
+		WHERE classroom_id = $1`
+	err = DB.QueryRow(firstClassQuery, classroomID).Scan(&firstClassStart)
+	if err != nil && err != sql.ErrNoRows {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Failed to check class schedule",
+			Data:    nil,
+		})
+		return
+	}
+
+	// If there is at least one class and it has already started
+	if !firstClassStart.IsZero() && firstClassStart.Before(time.Now()) {
+		utils.RespondWithJSON(w, http.StatusForbidden, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Classes already started. Cannot enroll now.",
+			Data:    nil,
+		})
+		return
+	}
+
 	// Enroll the student
 	var enrollmentID int
 	joinedAt := time.Now()
@@ -225,9 +251,238 @@ func JoinClassroom(w http.ResponseWriter, r *http.Request) {
 		Data:    &enrollment,
 	})
 }
-func MarkAttendance(w http.ResponseWriter, r *http.Request) {}
 
-func ViewHistory(w http.ResponseWriter, r *http.Request) {}
+func MarkAttendance(w http.ResponseWriter, r *http.Request) {
+
+	type AttendanceRequest struct {
+		CheckedInTime time.Time `json:"checked_in_time"`
+		IsPresent     bool      `json:"is_present"`
+	}
+
+	params := mux.Vars(r)
+	tokenStr := params["token"]
+	classIDStr := params["id"]
+
+	token, err := strconv.Atoi(tokenStr)
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusBadRequest, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Invalid student token",
+			Data:    nil,
+		})
+		return
+	}
+
+	classID, err := strconv.Atoi(classIDStr)
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusBadRequest, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Invalid class ID",
+			Data:    nil,
+		})
+		return
+	}
+
+	var input AttendanceRequest
+	err = json.NewDecoder(r.Body).Decode(&input)
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusBadRequest, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Invalid JSON payload",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Step 1: Get student ID from token
+	var studentID int
+	err = DB.QueryRow(`SELECT id FROM students WHERE token = $1`, token).Scan(&studentID)
+	if err == sql.ErrNoRows {
+		utils.RespondWithJSON(w, http.StatusNotFound, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Student not found",
+			Data:    nil,
+		})
+		return
+	} else if err != nil {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Database error finding student",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Step 2: Get classroom ID and meet link from class ID
+	var classroomID int
+	var meetLink string
+	err = DB.QueryRow(`SELECT classroom_id, link FROM classes WHERE id = $1`, classID).Scan(&classroomID, &meetLink)
+	if err == sql.ErrNoRows {
+		utils.RespondWithJSON(w, http.StatusNotFound, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Class not found",
+			Data:    nil,
+		})
+		return
+	} else if err != nil {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Database error finding class",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Step 3: Determine attendance status
+	status := "absent"
+	if input.IsPresent {
+		status = "present"
+	}
+
+	// Step 4: Insert into attendance table
+	_, err = DB.Exec(`
+		INSERT INTO attendance (student_id, class_id, attended_at, status)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (student_id, class_id) DO UPDATE 
+		SET status = EXCLUDED.status, attended_at = EXCLUDED.attended_at
+	`, studentID, classID, input.CheckedInTime, status)
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Failed to mark attendance",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Step 5: Update or insert into record table
+	if status == "present" {
+		_, err = DB.Exec(`
+			INSERT INTO record (student_id, classroom_id, present_count, last_attended)
+			VALUES ($1, $2, 1, $3)
+			ON CONFLICT (student_id, classroom_id) DO UPDATE 
+			SET present_count = record.present_count + 1, last_attended = EXCLUDED.last_attended
+		`, studentID, classroomID, input.CheckedInTime)
+	} else {
+		_, err = DB.Exec(`
+			INSERT INTO record (student_id, classroom_id, absent_count, last_attended)
+			VALUES ($1, $2, 1, $3)
+			ON CONFLICT (student_id, classroom_id) DO UPDATE 
+			SET absent_count = record.absent_count + 1, last_attended = EXCLUDED.last_attended
+		`, studentID, classroomID, input.CheckedInTime)
+	}
+
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Failed to update record table",
+			Data:    nil,
+		})
+		return
+	}
+
+	data := any(map[string]string{"meet_link": meetLink})
+
+	// Step 6: Return meet link
+	utils.RespondWithJSON(w, http.StatusOK, utils.APIResponse[any]{
+		Status:  "success",
+		Message: "Attendance marked successfully",
+		Data:    &data,
+	})
+}
+func ViewHistory(w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+	tokenStr := params["token"]
+	classroomIDStr := params["classroom_id"]
+
+	// Parse classroom ID
+	classroomID, err := strconv.Atoi(classroomIDStr)
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusBadRequest, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Invalid classroom ID",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Parse token as int (assuming token is integer)
+	token, err := strconv.Atoi(tokenStr)
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusBadRequest, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Invalid token",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Step 1: Get student ID and name from token
+	var studentID int
+	var studentName string
+	err = DB.QueryRow(`SELECT id, name FROM students WHERE token = $1`, token).Scan(&studentID, &studentName)
+	if err == sql.ErrNoRows {
+		utils.RespondWithJSON(w, http.StatusNotFound, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Student not found",
+			Data:    nil,
+		})
+		return
+	} else if err != nil {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Database error",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Step 2: Get attendance summary (present_count, absent_count)
+	var presentCount, absentCount int
+	err = DB.QueryRow(`
+		SELECT present_count, absent_count 
+		FROM record 
+		WHERE student_id = $1 AND classroom_id = $2
+	`, studentID, classroomID).Scan(&presentCount, &absentCount)
+
+	if err == sql.ErrNoRows {
+		// If no record found, assume 0 attendance
+		presentCount = 0
+		absentCount = 0
+	} else if err != nil {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Failed to fetch attendance record",
+			Data:    nil,
+		})
+		return
+	}
+
+	totalAttendance := presentCount + absentCount
+	var attendancePercentage float64
+	if totalAttendance > 0 {
+		attendancePercentage = (float64(presentCount) / float64(totalAttendance)) * 100
+	} else {
+		attendancePercentage = 0.0
+	}
+
+	responseData := map[string]any{
+		"id":                    strconv.Itoa(studentID),
+		"name":                  studentName,
+		"total_class_taken":     totalAttendance,
+		"present_count":         presentCount,
+		"absent_count":          absentCount,
+		"attendance_percentage": attendancePercentage,
+	}
+
+	resp := utils.APIResponse[map[string]any]{
+		Status:  "success",
+		Message: "Student attendance progress retrieved",
+		Data:    &responseData,
+	}
+
+	utils.RespondWithJSON(w, http.StatusOK, resp)
+}
 
 func generateUniqueToken() (int, error) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
