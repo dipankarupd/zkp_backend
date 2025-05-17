@@ -15,6 +15,7 @@ func RegisterNewRoutes(router *mux.Router, database db.DB) {
 	/// Student Routes:
 	router.HandleFunc("/api/student/register", controllers.RegisterUser).Methods("POST")
 	router.HandleFunc("/api/student/user/{token}", controllers.GetUserByToken).Methods("GET")
+	router.HandleFunc("/api/student/{token}/classrooms", controllers.GetClassroomsOfStudent).Methods("GET")
 	router.HandleFunc("/api/classrooms/{id}/join", controllers.JoinClassroom).Methods("POST")
 	router.HandleFunc("/api/student/{token}/classes/{id}/attendance", controllers.MarkAttendance).Methods("POST")
 	router.HandleFunc("/api/students/{token}/classrooms/{classroom_id}/progress", controllers.ViewHistory).Methods("GET")

@@ -484,6 +484,92 @@ func ViewHistory(w http.ResponseWriter, r *http.Request) {
 	utils.RespondWithJSON(w, http.StatusOK, resp)
 }
 
+func GetClassroomsOfStudent(w http.ResponseWriter, r *http.Request) {
+	params := mux.Vars(r)
+	tokenStr := params["token"]
+
+	// Convert token to int
+	token, err := strconv.Atoi(tokenStr)
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusBadRequest, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Invalid student token",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Get student ID from token
+	var studentID int
+	err = DB.QueryRow(`SELECT id FROM students WHERE token = $1`, token).Scan(&studentID)
+	if err == sql.ErrNoRows {
+		utils.RespondWithJSON(w, http.StatusNotFound, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Student not found for provided token",
+			Data:    nil,
+		})
+		return
+	} else if err != nil {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Database error while retrieving student",
+			Data:    nil,
+		})
+		return
+	}
+
+	// Fetch classrooms student is enrolled in
+	rows, err := DB.Query(`
+		SELECT c.id, c.name, c.description, c.teacher_name, c.created_at
+		FROM classrooms c
+		INNER JOIN student_classroom_enrollment e ON c.id = e.classroom_id
+		WHERE e.student_id = $1
+		ORDER BY c.created_at ASC
+	`, studentID)
+
+	if err != nil {
+		utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+			Status:  "error",
+			Message: "Database error while fetching classrooms",
+			Data:    nil,
+		})
+		return
+	}
+	defer rows.Close()
+
+	var classrooms []map[string]any
+	for rows.Next() {
+		var id int
+		var name, description, teacherName string
+		var createdAt time.Time
+
+		if err := rows.Scan(&id, &name, &description, &teacherName, &createdAt); err != nil {
+			utils.RespondWithJSON(w, http.StatusInternalServerError, utils.APIResponse[any]{
+				Status:  "error",
+				Message: "Error parsing classroom row",
+				Data:    nil,
+			})
+			return
+		}
+
+		classroom := map[string]any{
+			"id":           strconv.Itoa(id),
+			"name":         name,
+			"description":  description,
+			"teacher_name": teacherName,
+			"created_at":   createdAt.Format(time.RFC3339),
+		}
+		classrooms = append(classrooms, classroom)
+	}
+
+	res := any(classrooms)
+	utils.RespondWithJSON(w, http.StatusOK, utils.APIResponse[any]{
+		Status:  "success",
+		Message: "Classrooms retrieved successfully",
+		Data:    &res,
+	})
+}
+
 func generateUniqueToken() (int, error) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
